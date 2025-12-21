@@ -479,14 +479,22 @@ public static async Task<bool> EnsureValidToken()
 - [ ] Create UI for chapter preferences
 - [ ] Test chapter generation on completed streams
 
-### Phase 5: Kill Tracking Investigation
-- [ ] Examine log files for kill-related data
-- [ ] Search for session result/statistics entries
-- [ ] Document kill data structure if found
-- [ ] Implement KillDetected event if data available
-- [ ] Add kill event parsing in GameWatcher
-- [ ] Create kill-based markers and chapters
-- [ ] Add kill tracking settings/preferences
+### Phase 5: OCR Kill Tracking Implementation
+- [ ] Add OCR library dependency (Tesseract or Windows.Media.Ocr)
+- [ ] Create EndOfRaidScreenDetector class
+- [ ] Implement kill list region detection
+- [ ] Create KillListOcrService for text extraction
+- [ ] Build KillListParser with time-anchor logic
+- [ ] Add KillEvent data model class
+- [ ] Integrate with GameWatcher event flow
+- [ ] Create kill_events database table in Stats.cs
+- [ ] Add kill persistence methods
+- [ ] Implement KillListDetected event handler in MainBlazorUI
+- [ ] Add kill data to chapter generation
+- [ ] Create settings for kill tracking options
+- [ ] Test with various kill scenarios (mixed PMC/Scav, partial dogtags)
+- [ ] Handle different resolutions and UI scales
+- [ ] Add error handling for OCR failures
 
 ### Phase 6: Error Handling & Polish
 - [ ] Handle rate limiting (quota: 10,000 units/day)
@@ -834,20 +842,52 @@ public class LoadoutItemPropertiesDogtag
 
 **Not recommended** for real-time stream markers as it requires post-raid inventory analysis.
 
-#### Method 2: End-of-Raid Screen Parsing
+#### Method 2: End-of-Raid Screen OCR (Recommended)
 
-**The user mentions**: "there is a screen at the end of a raid that shows all kills and their time"
+**Authoritative Source**: End-of-raid kill list UI screen
 
-**Investigation needed**:
-1. Does EFT log this data when the end-of-raid screen is shown?
-2. If so, what log entry pattern contains this information?
-3. Format: JSON with kill list and timestamps?
+**Update**: Investigation has determined that kill data is **NOT reliably logged** to game files. The recommended approach is OCR-based extraction from the end-of-raid kill list screen.
 
-**Potential log patterns to search for**:
-- Session results/statistics
-- Raid summary/report
-- Kill list notifications
-- Experience gain breakdown (which includes kill XP)
+**Implementation Approach**:
+1. Detect when end-of-raid kill list screen is visible
+2. Capture only the kill list region (no full-screen)
+3. OCR the captured image
+4. Parse kill list into structured records
+5. Persist using existing mechanisms
+
+**Guaranteed Data Fields**:
+- ✅ Kill timestamp (always present)
+- ✅ Enemy type (always present - PMC/Scav/Boss)
+- ⚠️ PMC name (only if dogtag looted)
+- ⚠️ Weapon name (only if dogtag looted)
+
+**Data Model**:
+```csharp
+public class KillEvent
+{
+    public string RaidId { get; set; }
+    public int KillIndex { get; set; }
+    public string KillTime { get; set; }        // Always present
+    public string EnemyType { get; set; }       // Always present
+    public string? PmcName { get; set; }        // Nullable - only if looted
+    public string? WeaponName { get; set; }     // Nullable - only if looted
+    public string RawOcrRow { get; set; }       // For diagnostics
+}
+```
+
+**OCR & Parsing Rules**:
+- Time column is primary row anchor
+- Rows retained even if PMC-specific fields missing
+- Must tolerate variable column counts
+- Store raw OCR output for diagnostics
+
+**Integration Requirements**:
+- ✅ Follow existing module boundaries
+- ✅ Reuse existing screen-watching infrastructure
+- ✅ Feature must be optional/configurable
+- ✅ Must not break existing features
+- ❌ No in-raid capture
+- ❌ No memory inspection or packet capture
 
 **Example search pattern**:
 ```csharp
@@ -873,163 +913,344 @@ if (eventLine.Contains("session result") ||
 }
 ```
 
-#### Method 3: Real-Time Kill Detection (Unknown)
+#### Method 3: Real-Time Kill Detection (Not Available)
 
-**Requires investigation**:
-- Do logs contain real-time kill notifications?
-- Pattern: "You killed {name}" or similar?
-- JSON structure for kill events?
+**Status**: Kill events are **NOT logged** to game files in real-time.
 
-**If available**, this would be ideal for:
-- ✅ Real-time stream markers
-- ✅ Immediate YouTube cue points
-- ✅ Chapter generation with kill timestamps
+**Conclusion**: OCR-based end-of-raid screen parsing (Method 2) is the only viable approach.
 
-### Recommended Investigation Steps
+### OCR Implementation Architecture
 
-To determine if kill tracking is feasible:
+#### Required Components
 
-1. **Capture Sample Logs**:
-   ```
-   - Play a raid and get several kills
-   - Check application.log after raid
-   - Check notifications.log after raid
-   - Search for patterns containing kill/death/frag data
-   ```
-
-2. **Search for Keywords**:
-   ```
-   - "kill", "killed", "eliminated", "neutralized"
-   - "experience", "exp" (kill XP entries)
-   - "session", "statistics", "report", "result"
-   - "dogtag" (for indirect detection)
-   ```
-
-3. **Analyze End-of-Raid Log Entries**:
-   ```
-   - Compare logs before and after viewing end-screen
-   - Look for JSON blobs with kill arrays
-   - Check for timestamp data matching in-raid times
-   ```
-
-4. **Test Data Structure**:
-   ```csharp
-   // Expected structure (if exists):
-   public class SessionResultLogContent : JsonLogContent
-   {
-       public SessionStatistics statistics { get; set; }
-   }
-   
-   public class SessionStatistics
-   {
-       public List<KillData> kills { get; set; }
-       public int experience { get; set; }
-       public float timeInRaid { get; set; }
-   }
-   
-   public class KillData
-   {
-       public string name { get; set; }      // Victim name
-       public string weapon { get; set; }     // Weapon used
-       public string bodyPart { get; set; }   // Headshot, thorax, etc.
-       public float time { get; set; }        // Time offset from raid start
-       public int distance { get; set; }      // Distance in meters
-       public int level { get; set; }         // Victim level
-       public string side { get; set; }       // PMC/Scav/Boss
-   }
-   ```
-
-### Implementation If Kill Data Is Available
-
-**During Raid** (if real-time kills are logged):
+**1. Screen Detection Module**
 ```csharp
-if (eventLine.Contains("Got notification | Kill") || 
-    eventLine.Contains("You killed"))
+public class EndOfRaidScreenDetector
 {
-    var killData = ParseKillEvent(jsonNode);
-    Emit KillDetected event
-    → Create stream marker: "Kill - {victimName} with {weapon}"
-    → Record for chapter generation
+    // Detect when kill list screen is visible
+    public bool IsKillListScreenVisible()
+    {
+        // Use existing screen-watching infrastructure
+        // Look for specific UI elements/patterns
+        // Return true when kill list is displayed
+    }
+    
+    public Rectangle GetKillListRegion()
+    {
+        // Return bounding box for kill list area only
+        // Avoid full-screen capture
+    }
 }
 ```
 
-**After Raid** (if end-screen provides kill summary):
+**2. OCR Service**
 ```csharp
-if (eventLine.Contains("session result"))
+public class KillListOcrService
 {
-    var sessionData = ParseSessionResult(jsonNode);
-    foreach (var kill in sessionData.kills)
+    // Recommended: Tesseract OCR engine
+    // Alternative: Windows.Media.Ocr (built-in)
+    
+    public async Task<List<string>> ExtractKillListRows(Bitmap killListImage)
     {
-        // Retroactively create chapter entries
-        eventTimestamps.Add(new StreamEvent {
-            RelativeTime = raidStartTime.Add(kill.timeOffset),
-            Description = $"Kill - {kill.name} ({kill.weapon})"
+        // OCR the kill list region
+        // Return one string per row
+    }
+}
+```
+
+**3. Parser Module**
+```csharp
+public class KillListParser
+{
+    public List<KillEvent> ParseKillList(List<string> ocrRows, string raidId)
+    {
+        var kills = new List<KillEvent>();
+        
+        for (int i = 0; i < ocrRows.Count; i++)
+        {
+            var row = ocrRows[i];
+            
+            // Time column is primary anchor
+            var timeMatch = Regex.Match(row, @"(\d{1,2}:\d{2})");
+            if (!timeMatch.Success)
+                continue; // Skip invalid rows
+            
+            var killEvent = new KillEvent
+            {
+                RaidId = raidId,
+                KillIndex = i,
+                KillTime = timeMatch.Groups[1].Value,
+                RawOcrRow = row
+            };
+            
+            // Parse enemy type (always present)
+            if (row.Contains("PMC") || row.Contains("BEAR") || row.Contains("USEC"))
+                killEvent.EnemyType = "PMC";
+            else if (row.Contains("Scav"))
+                killEvent.EnemyType = "Scav";
+            else if (row.Contains("Boss") || row.Contains("Raider"))
+                killEvent.EnemyType = "Boss";
+            else
+                killEvent.EnemyType = "Unknown";
+            
+            // Parse optional PMC name (only if dogtag looted)
+            // Pattern: extract name between time and weapon
+            // Handle missing gracefully
+            
+            // Parse optional weapon name (only if dogtag looted)
+            // Pattern: weapon typically at end of row
+            // Handle missing gracefully
+            
+            kills.Add(killEvent);
+        }
+        
+        return kills;
+    }
+}
+```
+
+**4. Integration with GameWatcher**
+```csharp
+// In GameWatcher.cs
+public event EventHandler<KillListDetectedEventArgs>? KillListDetected;
+
+private EndOfRaidScreenDetector screenDetector;
+private KillListOcrService ocrService;
+private KillListParser killParser;
+
+// After RaidExited event
+private async void CheckForKillList()
+{
+    if (!Properties.Settings.Default.enableKillTracking)
+        return;
+        
+    // Wait for kill list screen
+    await Task.Delay(2000); // Allow screen transition
+    
+    if (screenDetector.IsKillListScreenVisible())
+    {
+        var killListRegion = screenDetector.GetKillListRegion();
+        var screenshot = CaptureScreen(killListRegion);
+        
+        var ocrRows = await ocrService.ExtractKillListRows(screenshot);
+        var kills = killParser.ParseKillList(ocrRows, raidInfo.RaidId);
+        
+        KillListDetected?.Invoke(this, new KillListDetectedEventArgs
+        {
+            RaidInfo = raidInfo,
+            Kills = kills
         });
     }
 }
 ```
 
-**Settings Configuration**:
+#### Persistence Integration
+
+**Using Existing Stats.cs Pattern**:
+```csharp
+// In Stats.cs
+public static void AddKillEvent(KillEvent killEvent, Profile profile)
+{
+    var sql = @"INSERT INTO kill_events
+                (raid_id, kill_index, kill_time, enemy_type, 
+                 pmc_name, weapon_name, raw_ocr_row, profile_id) 
+                VALUES (@raid_id, @kill_index, @kill_time, @enemy_type,
+                        @pmc_name, @weapon_name, @raw_ocr_row, @profile_id);";
+    
+    var parameters = new Dictionary<string, object>
+    {
+        { "raid_id", killEvent.RaidId },
+        { "kill_index", killEvent.KillIndex },
+        { "kill_time", killEvent.KillTime },
+        { "enemy_type", killEvent.EnemyType },
+        { "pmc_name", killEvent.PmcName ?? DBNull.Value },
+        { "weapon_name", killEvent.WeaponName ?? DBNull.Value },
+        { "raw_ocr_row", killEvent.RawOcrRow },
+        { "profile_id", profile.Id }
+    };
+    
+    Query(sql, parameters);
+}
+
+// Database schema update
+private static void CreateKillEventsTable()
+{
+    var sql = @"CREATE TABLE IF NOT EXISTS kill_events (
+        id INTEGER PRIMARY KEY,
+        raid_id VARCHAR(24),
+        kill_index INTEGER,
+        kill_time VARCHAR(10),
+        enemy_type VARCHAR(20),
+        pmc_name VARCHAR(100),
+        weapon_name VARCHAR(100),
+        raw_ocr_row TEXT,
+        profile_id VARCHAR(24),
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );";
+    
+    using var command = new SQLiteCommand(Connection);
+    command.CommandText = sql;
+    command.ExecuteNonQuery();
+}
 ```
-Kill Tracking:
+
+### Recommended Investigation Steps
+
+~~To determine if kill tracking is feasible:~~
+
+**Update**: Investigation complete. Kill data is NOT in game logs. OCR-based approach required.
+
+**Implementation Steps**:
+
+1. **Add OCR Dependencies**:
+   ```xml
+   <!-- Add to TarkovMonitor.csproj -->
+   <PackageReference Include="Tesseract" Version="5.2.0" />
+   <!-- OR use built-in Windows.Media.Ocr -->
+   ```
+
+2. **Create Screen Detection Logic**:
+   - Identify unique UI elements of kill list screen
+   - Determine kill list bounding box coordinates
+   - Handle different resolutions/aspect ratios
+
+3. **Implement OCR Pipeline**:
+   - Capture kill list region only
+   - Pre-process image for better OCR accuracy
+   - Extract text rows
+
+4. **Build Parser**:
+   - Anchor on time column
+   - Extract enemy type
+   - Handle optional PMC name/weapon fields
+   - Preserve raw OCR for debugging
+
+5. **Test with Various Scenarios**:
+   - Mixed kills (PMCs + Scavs)
+   - All PMC kills with dogtags looted
+   - No PMC kills (Scavs only)
+   - Partial dogtag collection
+
+6. **Integration**:
+   - Add to existing event flow
+   - Persist to SQLite database
+   - Make feature configurable
+   - Add UI toggle in Settings
+
+### Configuration & Settings
+
+**Settings.Designer.cs additions**:
+```csharp
+[UserScopedSetting]
+[DefaultSettingValue("False")]
+public bool enableKillTracking { get; set; }
+
+[UserScopedSetting]
+[DefaultSettingValue("True")]
+public bool includeKillsInMarkers { get; set; }
+
+[UserScopedSetting]
+[DefaultSettingValue("True")]
+public bool includeKillsInChapters { get; set; }
+
+[UserScopedSetting]
+[DefaultSettingValue("PMC")]
+public string killTrackingFilter { get; set; } // "All", "PMC", "PMCWithLoot"
+```
+
+**UI Configuration**:
+```
+Kill Tracking (OCR-based):
 ┌─────────────────────────────────────┐
-│ ☑ Track Kills                      │
-│   ○ Real-time (if available)       │
-│   ● End-of-raid summary            │
+│ ☑ Enable Kill Tracking             │
+│   (Reads end-of-raid kill list)    │
 │                                     │
-│ Kill Marker Format:                 │
-│ [Dropdown] "Kill - {name}"         │
-│   Options:                          │
-│   - "Kill - {name}"                │
-│   - "Kill - {name} ({weapon})"     │
-│   - "Kill with {weapon}"           │
-│   - "PMC/Scav Kill"                │
+│ Filter:                             │
+│ ○ All Kills (PMC + Scav)           │
+│ ● PMC Kills Only                   │
+│ ○ PMC with Looted Dogtags Only     │
 │                                     │
+│ Stream Integration:                 │
 │ ☑ Include in stream markers        │
 │ ☑ Include in chapters              │
-│ ☐ Minimum kills for chapter (3+)  │
+│                                     │
+│ Marker Format:                      │
+│ [Kill - {type} at {time}]          │
+│   Example: "Kill - PMC at 12:34"   │
 └─────────────────────────────────────┘
+```
+
+```
+
+### YouTube Integration with OCR Kill Data
+
+**Post-Raid Chapter Generation**:
+```csharp
+// In MainBlazorUI.cs
+private async void Eft_KillListDetected(object? sender, KillListDetectedEventArgs e)
+{
+    if (!Properties.Settings.Default.enableKillTracking)
+        return;
+        
+    // Store kills for this raid
+    foreach (var kill in e.Kills)
+    {
+        Stats.AddKillEvent(kill, e.Profile);
+        
+        // Add to stream recorder for chapter generation
+        if (streamRecorder != null && Properties.Settings.Default.includeKillsInChapters)
+        {
+            var description = FormatKillDescription(kill);
+            streamRecorder.RecordEvent("Kill", description);
+        }
+    }
+    
+    messageLog.AddMessage($"Recorded {e.Kills.Count} kills from raid {e.RaidInfo.Map}");
+}
+
+private string FormatKillDescription(KillEvent kill)
+{
+    if (!string.IsNullOrEmpty(kill.PmcName) && !string.IsNullOrEmpty(kill.WeaponName))
+        return $"Kill - {kill.PmcName} with {kill.WeaponName} at {kill.KillTime}";
+    else if (!string.IsNullOrEmpty(kill.PmcName))
+        return $"Kill - {kill.PmcName} at {kill.KillTime}";
+    else
+        return $"Kill - {kill.EnemyType} at {kill.KillTime}";
+}
 ```
 
 ### Limitations and Considerations
 
-**If Kill Data Is NOT in Logs**:
-- Cannot implement real-time kill tracking
-- Cannot create kill-based stream markers
-- Cannot generate kill timestamps for chapters
-- **Alternative**: Track "Raid Ended" with final kill count if available in session stats
+**OCR-Based Approach**:
+- ✅ Captures all kills (PMC + Scav + Boss)
+- ✅ Includes timestamps for accurate chapter timing
+- ✅ Works post-raid (no performance impact during gameplay)
+- ⚠️ Requires screen detection and OCR accuracy
+- ⚠️ PMC details only available if dogtags looted
+- ❌ Not real-time (cannot create live stream markers during raid)
 
-**If Kill Data IS in Logs**:
-- ✅ Real-time stream markers for each kill
-- ✅ Accurate chapter timestamps
-- ✅ Enhanced viewer engagement
-- ⚠️ May create too many markers (quota management)
-- ⚠️ Need filtering (minimum kills, time gaps)
+**Stream Integration Strategy**:
+- **Live Markers**: NOT available (no real-time kill data)
+- **Chapters**: Full support with accurate timestamps from OCR
+- **Recommended**: Include all kills in chapters, filter in settings
 
 **Quota Management for Kills**:
-- Limit to major kills (PMC kills only, not scavs)
-- Batch kills within 1-minute windows
-- Set maximum kills per raid for markers (e.g., top 5)
-- Always include in chapter generation (post-raid, no quota impact)
+- No quota impact (chapters are post-stream, one-time cost)
+- Can include all kills in chapters without concern
+- Filter options: All kills, PMC only, PMC with dogtags only
+- Always include in chapter generation for comprehensive timeline
 
-### Next Steps for Kill Tracking
+### Acceptance Criteria
 
-1. **Verify log data availability**:
-   - Play test raid with kills
-   - Examine log files for kill-related entries
-   - Document exact log patterns and JSON structure
-
-2. **If kill data found**:
-   - Add `KillDetected` event to GameWatcher
-   - Create `KillEventArgs` class
-   - Implement parsing in `GameWatcher_NewLogData`
-   - Add event handler in MainBlazorUI
-   - Integrate with YouTubeStreamRecorder
-
-3. **If kill data NOT found**:
-   - Document limitation
-   - Suggest alternative: Total kills in end-of-raid summary
-   - Consider feature request to BSG for better logging
+- ✅ Per-kill timestamps reliably captured from end-of-raid screen
+- ✅ Mixed raids (Scavs + PMCs) parse correctly  
+- ✅ Missing PMC enrichment fields do not cause row loss
+- ✅ Feature cleanly coexists with all existing features
+- ✅ Optional/configurable via settings
+- ✅ Follows existing module boundaries and patterns
+- ✅ Uses existing persistence (Stats.cs SQLite pattern)
+- ✅ No in-raid capture or memory inspection
+- ✅ No breaking changes to existing features
 
 ## Recommendations
 
@@ -1076,22 +1297,31 @@ YouTube Live Streaming integration is feasible and aligns well with TarkovMonito
 
 ### Kill Tracking Status
 
-**Investigation Required**:
-The presence of kill data in EFT logs needs verification through:
-1. Log file examination during/after raids with kills
-2. Analysis of session result/statistics entries
-3. Documentation of any kill-related JSON structures
+**Investigation Complete**: Kill data is **NOT available in game logs**.
 
-**If Kill Data Available**:
-- ✅ Real-time kill markers during stream
-- ✅ Kill timestamps in chapter generation
-- ✅ Enhanced viewer engagement
-- ⚠️ Requires quota management (filter/batch kills)
+**Solution**: OCR-based extraction from end-of-raid kill list screen.
 
-**If Kill Data NOT Available**:
-- Focus on other rich events (raids, quests, market)
-- Document limitation for future enhancement
-- Consider total kill count from end-of-raid stats
+**Implementation Approach**:
+- Screen detection for kill list UI
+- OCR extraction of kill rows
+- Time-anchored parsing with optional PMC fields
+- SQLite persistence following existing patterns
+- Integration with chapter generation (post-raid)
+
+**Capabilities**:
+- ✅ All kills captured (PMC + Scav + Boss)
+- ✅ Accurate timestamps for chapters
+- ✅ Optional PMC name/weapon (when dogtag looted)
+- ✅ No performance impact during raid
+- ❌ No real-time stream markers (post-raid only)
+
+**Acceptance Criteria Met**:
+- Per-kill timestamps from end-of-raid screen
+- Mixed kill types handled correctly
+- Missing PMC fields do not cause data loss
+- Optional/configurable feature
+- Follows existing architectural patterns
+- No in-raid capture or memory inspection
 
 **Key Differences from Existing Auth**:
 - OAuth 2.0 vs static API keys
@@ -1107,6 +1337,7 @@ The presence of kill data in EFT logs needs verification through:
 - Follow existing TarkovMonitor patterns for consistency
 - Allow independent enabling of markers and chapters
 - Implement smart filtering for quota management
+- Use OCR for kill tracking (no game memory access)
 
 **Next Steps**:
 1. Create Google Cloud project and obtain OAuth credentials
@@ -1114,7 +1345,8 @@ The presence of kill data in EFT logs needs verification through:
 3. Add OAuth flow UI to Settings page
 4. Create YouTubeStreamRecorder class for event tracking
 5. Integrate with existing GameWatcher events
-6. Investigate kill data availability in logs
+6. Implement OCR kill tracking (EndOfRaidScreenDetector, KillListOcrService, KillListParser)
 7. Implement chapter generation logic
-8. Test with live YouTube broadcasts
-9. Validate chapters on VOD playback
+8. Add kill events to chapter generation
+9. Test with live YouTube broadcasts
+10. Validate chapters on VOD playback with kill timestamps
