@@ -8,6 +8,14 @@
 
 TarkovMonitor is an Escape from Tarkov companion application that provides useful audio notifications, can automatically update your task progress on Tarkov Tracker, and includes other helpful features.
 
+## Developer Documentation
+
+This repository includes comprehensive documentation for developers:
+
+- **[CODEBASE_ANALYSIS.md](CODEBASE_ANALYSIS.md)** - Complete documentation of all classes and methods in the codebase
+- **[WORKFLOW.md](WORKFLOW.md)** - Detailed event flow and workflow documentation
+- **[YOUTUBE_INTEGRATION.md](YOUTUBE_INTEGRATION.md)** - Research and recommendations for YouTube Live Streaming integration with automatic stream markers
+
 ## Features
 
 - Audio notifications
